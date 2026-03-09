@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import logging
 from datetime import datetime
@@ -11,7 +10,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # =========================================================
-# LOAD ENV
+# ENV
 # =========================================================
 load_dotenv()
 
@@ -44,23 +43,20 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# =========================================================
-# BOT
-# =========================================================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 user_data = {}
 
 # =========================================================
-# DATABASE TABLE NAMES (NEW NAMES)
+# TABLE NAMES
 # =========================================================
-TABLE_SETTINGS = "app_settings_v2"
-TABLE_ADMINS = "app_admins_v2"
-TABLE_CATEGORIES = "shop_categories_v2"
-TABLE_PACKAGES = "shop_packages_v2"
-TABLE_ORDERS = "shop_orders_v2"
+TABLE_SETTINGS = "app_settings_v3"
+TABLE_ADMINS = "app_admins_v3"
+TABLE_CATEGORIES = "shop_categories_v3"
+TABLE_PACKAGES = "shop_packages_v3"
+TABLE_ORDERS = "shop_orders_v3"
 
 # =========================================================
-# DEFAULT SETTINGS
+# DEFAULT DATA
 # =========================================================
 DEFAULT_PAYMENT_INFO = """💳 <b>Payment Information</b>
 
@@ -95,26 +91,6 @@ DEFAULT_PACKAGES = [
     ("BONUS PACKAGE", "22 Diamond", "1500 ks", "Bonus package", 2, True),
     ("BONUS PACKAGE", "56 Diamond", "3750 ks", "Bonus package", 3, True),
 ]
-
-# =========================================================
-# EASY COLUMN EXTENSION
-# နောက်ပိုင်း column အသစ်တိုးချင်ရင် ဒီ dict ထဲထည့်
-# ဥပမာ:
-# "customer_note": "TEXT DEFAULT ''"
-# "payment_method": "TEXT DEFAULT ''"
-# =========================================================
-ORDER_EXTRA_COLUMNS = {
-    # "customer_note": "TEXT DEFAULT ''",
-    # "payment_method": "TEXT DEFAULT ''",
-}
-
-PACKAGE_EXTRA_COLUMNS = {
-    # "image_url": "TEXT DEFAULT ''",
-}
-
-CATEGORY_EXTRA_COLUMNS = {
-    # "icon_emoji": "TEXT DEFAULT ''",
-}
 
 # =========================================================
 # HELPERS
@@ -157,16 +133,15 @@ def actor_name(obj):
 
 
 # =========================================================
-# DATABASE CORE
+# DATABASE
 # =========================================================
 def get_connection():
     try:
-        conn = psycopg2.connect(
+        return psycopg2.connect(
             DATABASE_URL,
             cursor_factory=RealDictCursor,
             sslmode="require"
         )
-        return conn
     except Exception as e:
         logging.exception("Database connection failed: %s", e)
         raise
@@ -206,19 +181,6 @@ def execute_query(query, params=None, fetchone=False, fetchall=False, commit=Fal
                 conn.close()
         except Exception:
             pass
-
-
-def ensure_column(table_name, column_name, column_def):
-    query = f"""
-    SELECT 1
-    FROM information_schema.columns
-    WHERE table_name = %s AND column_name = %s
-    """
-    row = execute_query(query, (table_name, column_name), fetchone=True)
-    if not row:
-        alter_sql = f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {column_def}'
-        execute_query(alter_sql, commit=True)
-        logging.info("Added column %s.%s", table_name, column_name)
 
 
 def ensure_setting(key, value):
@@ -292,16 +254,6 @@ def init_db():
             updated_at TEXT NOT NULL
         )
         """, commit=True)
-
-        # Easy column extension
-        for col, col_def in ORDER_EXTRA_COLUMNS.items():
-            ensure_column(TABLE_ORDERS, col, col_def)
-
-        for col, col_def in PACKAGE_EXTRA_COLUMNS.items():
-            ensure_column(TABLE_PACKAGES, col, col_def)
-
-        for col, col_def in CATEGORY_EXTRA_COLUMNS.items():
-            ensure_column(TABLE_CATEGORIES, col, col_def)
 
         ensure_setting("payment_info", DEFAULT_PAYMENT_INFO)
         ensure_setting("public_admin_username", DEFAULT_PUBLIC_ADMIN)
@@ -886,7 +838,7 @@ def notify_user(order_id, user_id, status, note=""):
 
 
 # =========================================================
-# SAFE SEND WRAPPERS
+# SAFE SEND
 # =========================================================
 def safe_send_message(chat_id, text, **kwargs):
     try:
@@ -929,6 +881,27 @@ def start(message):
         safe_send_message(message.chat.id, "❌ Something went wrong. Please try again.")
 
 
+@bot.message_handler(func=lambda m: m.text == "🏠 Admin Panel")
+def open_admin_panel(message):
+    try:
+        if not is_admin_user(message):
+            safe_send_message(message.chat.id, "⛔ Admin only.", reply_markup=client_menu())
+            return
+        reset_user(message.chat.id)
+        safe_send_message(message.chat.id, "🏠 <b>Admin Panel</b>\n\nChoose an option below.", reply_markup=admin_home_markup(message))
+    except Exception as e:
+        logging.exception("open_admin_panel failed: %s", e)
+
+
+@bot.message_handler(func=lambda m: m.text == "👀 Client Panel")
+def open_client_panel(message):
+    try:
+        reset_user(message.chat.id)
+        safe_send_message(message.chat.id, "👀 <b>Client Panel</b>\n\nCustomer view is now open.", reply_markup=client_menu())
+    except Exception as e:
+        logging.exception("open_client_panel failed: %s", e)
+
+
 @bot.message_handler(func=lambda m: m.text == "📞 Contact Admin")
 def contact_admin(message):
     try:
@@ -938,10 +911,13 @@ def contact_admin(message):
         logging.exception("contact_admin failed: %s", e)
 
 
+# =========================================================
+# CLIENT ORDER FLOW
+# =========================================================
 @bot.message_handler(func=lambda m: m.text == "🛒 Order")
 def order_start(message):
     try:
-        if message.chat.id in user_data:
+        if message.chat.id in user_data and user_data.get(message.chat.id, {}).get("step"):
             safe_send_message(message.chat.id, "⚠️ You already have an active order step. Finish it or cancel first.", reply_markup=step_back_menu())
             return
 
@@ -963,8 +939,8 @@ def category_selected(message):
         category_name = message.text
         count = count_packages_by_category(category_name, only_active=True)
         user_data[message.chat.id] = {"step": "choose_category", "selected_category": category_name}
-        rows = get_packages_by_category_name(category_name, only_active=True)
 
+        rows = get_packages_by_category_name(category_name, only_active=True)
         if not rows:
             safe_send_message(message.chat.id, f"🗂 <b>{category_name}</b>\n\nဒီ category အောက်မှာ active package မရှိသေးပါ။", reply_markup=step_back_menu())
             return
@@ -1203,121 +1179,8 @@ def my_orders(message):
 
 
 # =========================================================
-# SIMPLE ADMIN ACTIONS
+# ADMIN PANEL HANDLERS
 # =========================================================
-@bot.callback_query_handler(func=lambda c: c.data.startswith(("done_", "cancel_", "viewss_")))
-def admin_actions(call):
-    try:
-        if not is_admin_user(call):
-            safe_answer_callback(call.id, "⛔ Admin only.")
-            return
-
-        if call.data.startswith("viewss_"):
-            order_id = int(call.data.split("_")[1])
-            row = get_order_by_id(order_id)
-            if row:
-                safe_send_photo(call.message.chat.id, row["screenshot_file_id"], caption=f"🖼 Screenshot for {format_order_no(order_id)}")
-                safe_answer_callback(call.id, "Screenshot sent.")
-            else:
-                safe_answer_callback(call.id, "Order not found.")
-            return
-
-        action, order_id_text = call.data.split("_")
-        order_id = int(order_id_text)
-        new_status = "Completed" if action == "done" else "Cancelled"
-
-        row = update_order_status(order_id, new_status, admin_note="", admin_action_by=actor_name(call))
-        if not row:
-            safe_answer_callback(call.id, "Order not found.")
-            return
-
-        notify_user(order_id, row["user_id"], new_status)
-        safe_answer_callback(call.id, f"{format_order_no(order_id)} → {new_status}")
-    except Exception as e:
-        logging.exception("admin_actions failed: %s", e)
-        safe_answer_callback(call.id, "❌ Failed.")
-
-@bot.message_handler(func=lambda m: m.text == "🏠 Admin Panel")
-def open_admin_panel(message):
-    try:
-        if not is_admin_user(message):
-            safe_send_message(message.chat.id, "⛔ Admin only.", reply_markup=client_menu())
-            return
-
-        reset_user(message.chat.id)
-        safe_send_message(
-            message.chat.id,
-            "🏠 <b>Admin Panel</b>\n\nChoose an option below.",
-            reply_markup=admin_home_markup(message)
-        )
-    except Exception as e:
-        logging.exception("open_admin_panel failed: %s", e)
-        safe_send_message(message.chat.id, "❌ Failed to open admin panel.")
-
-
-@bot.message_handler(func=lambda m: m.text == "👀 Client Panel")
-def open_client_panel(message):
-    try:
-        reset_user(message.chat.id)
-        safe_send_message(
-            message.chat.id,
-            "👀 <b>Client Panel</b>\n\nCustomer view is now open.",
-            reply_markup=client_menu()
-        )
-    except Exception as e:
-        logging.exception("open_client_panel failed: %s", e)
-        safe_send_message(message.chat.id, "❌ Failed to open client panel.")
-
-
-@bot.message_handler(func=lambda m: m.text == "🔙 Back")
-def back_handler(message):
-    try:
-        state = user_data.get(message.chat.id, {}).get("step", "")
-
-        if is_admin_user(message):
-            if state.startswith("manage_categories"):
-                reset_user(message.chat.id)
-                safe_send_message(message.chat.id, "🗂 Back to admin panel.", reply_markup=admin_home_markup(message))
-                return
-
-            if state.startswith("manage_packages"):
-                reset_user(message.chat.id)
-                safe_send_message(message.chat.id, "💎 Back to admin panel.", reply_markup=admin_home_markup(message))
-                return
-
-            if state.startswith("manage_admins"):
-                reset_user(message.chat.id)
-                safe_send_message(message.chat.id, "👥 Back to admin panel.", reply_markup=admin_home_markup(message))
-                return
-
-            if state in ["broadcast_wait_text", "change_payment_info", "change_admin_username", "search_order_wait_id"]:
-                reset_user(message.chat.id)
-                safe_send_message(message.chat.id, "🛠 Back to admin panel.", reply_markup=admin_home_markup(message))
-                return
-
-        # client flow back
-        if state == "choose_category":
-            reset_user(message.chat.id)
-            safe_send_message(message.chat.id, "🔙 Back to client panel.", reply_markup=client_menu())
-        elif state == "game_id":
-            user_data[message.chat.id] = {"step": "choose_category"}
-            safe_send_message(message.chat.id, "🛒 Choose category again.", reply_markup=category_menu())
-        elif state == "server_id":
-            user_data[message.chat.id]["step"] = "game_id"
-            safe_send_message(message.chat.id, "🎮 Send your Game ID again.", reply_markup=step_back_menu())
-        elif state in ["screenshot", "confirm_order"]:
-            user_data[message.chat.id]["step"] = "server_id"
-            safe_send_message(message.chat.id, "🖥 Send your Server ID again.", reply_markup=step_back_menu())
-        else:
-            reset_user(message.chat.id)
-            if is_admin_user(message):
-                safe_send_message(message.chat.id, "🛠 Back to admin panel.", reply_markup=admin_home_markup(message))
-            else:
-                safe_send_message(message.chat.id, "👤 Back to client panel.", reply_markup=client_menu())
-    except Exception as e:
-        logging.exception("back_handler failed: %s", e)
-        safe_send_message(message.chat.id, "❌ Back failed.")
-
 @bot.message_handler(func=lambda m: m.text == "📊 Dashboard")
 def dashboard_handler(message):
     try:
@@ -1435,6 +1298,7 @@ def search_order_prompt(message):
         logging.exception("search_order_prompt failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to open search.")
 
+
 @bot.message_handler(func=lambda m: user_data.get(m.chat.id, {}).get("step") == "search_order_wait_id", content_types=["text"])
 def search_order_input(message):
     try:
@@ -1469,6 +1333,10 @@ def search_order_input(message):
         logging.exception("search_order_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Search failed.")
 
+
+# =========================================================
+# MANAGE CATEGORIES
+# =========================================================
 @bot.message_handler(func=lambda m: m.text == "🗂 Manage Categories")
 def manage_categories_open(message):
     try:
@@ -1476,14 +1344,9 @@ def manage_categories_open(message):
             safe_send_message(message.chat.id, "⛔ Owner only.")
             return
         reset_user(message.chat.id)
-        safe_send_message(
-            message.chat.id,
-            "🗂 <b>Category Manager</b>\n\nCategory ကို add / rename / delete လုပ်နိုင်ပါတယ်။",
-            reply_markup=manage_category_menu()
-        )
+        safe_send_message(message.chat.id, "🗂 <b>Category Manager</b>\n\nCategory ကို add / rename / delete လုပ်နိုင်ပါတယ်။", reply_markup=manage_category_menu())
     except Exception as e:
         logging.exception("manage_categories_open failed: %s", e)
-        safe_send_message(message.chat.id, "❌ Failed to open category manager.")
 
 
 @bot.message_handler(func=lambda m: m.text == "📋 List Categories")
@@ -1543,6 +1406,7 @@ def delete_category_prompt(message):
         safe_send_message(message.chat.id, "🗑 Send category name to delete.", reply_markup=step_back_menu())
     except Exception as e:
         logging.exception("delete_category_prompt failed: %s", e)
+
 
 @bot.message_handler(func=lambda m: user_data.get(m.chat.id, {}).get("step") == "manage_categories_add", content_types=["text"])
 def add_category_input(message):
@@ -1620,6 +1484,10 @@ def delete_category_input(message):
         logging.exception("delete_category_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to delete category.")
 
+
+# =========================================================
+# MANAGE PACKAGES
+# =========================================================
 @bot.message_handler(func=lambda m: m.text == "💎 Manage Packages")
 def manage_packages_open(message):
     try:
@@ -1627,11 +1495,7 @@ def manage_packages_open(message):
             safe_send_message(message.chat.id, "⛔ Owner only.")
             return
         reset_user(message.chat.id)
-        safe_send_message(
-            message.chat.id,
-            "💎 <b>Package Manager</b>\n\nPackage ကို add / edit / delete / active toggle လုပ်နိုင်ပါတယ်။",
-            reply_markup=manage_package_menu()
-        )
+        safe_send_message(message.chat.id, "💎 <b>Package Manager</b>\n\nPackage ကို add / edit / delete / active toggle လုပ်နိုင်ပါတယ်။", reply_markup=manage_package_menu())
     except Exception as e:
         logging.exception("manage_packages_open failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to open package manager.")
@@ -1666,6 +1530,7 @@ def list_packages_handler(message):
         logging.exception("list_packages_handler failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to list packages.")
 
+
 @bot.message_handler(func=lambda m: m.text == "➕ Add Package")
 def add_package_prompt(message):
     try:
@@ -1686,6 +1551,7 @@ def add_package_prompt(message):
         safe_send_message(message.chat.id, text, reply_markup=step_back_menu())
     except Exception as e:
         logging.exception("add_package_prompt failed: %s", e)
+
 
 @bot.message_handler(func=lambda m: user_data.get(m.chat.id, {}).get("step") == "manage_packages_add_category", content_types=["text"])
 def add_package_category_input(message):
@@ -1744,12 +1610,7 @@ def add_package_description_input(message):
         data = user_data.get(message.chat.id, {})
         description = safe_text(message.text)
 
-        add_package(
-            data["category_name"],
-            data["name"],
-            data["price"],
-            description
-        )
+        add_package(data["category_name"], data["name"], data["price"], description)
 
         package = get_package_by_name(data["name"])
         reset_user(message.chat.id)
@@ -1765,7 +1626,6 @@ def add_package_description_input(message):
             reply_markup=manage_package_menu()
         )
 
-        # client-facing inline post
         safe_send_message(
             message.chat.id,
             f"🗂 <b>{package['category_name']}</b>\n📦 Package count updated.\n\nCustomer view inline buttons 👇",
@@ -1774,6 +1634,7 @@ def add_package_description_input(message):
     except Exception as e:
         logging.exception("add_package_description_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to add package.")
+
 
 @bot.message_handler(func=lambda m: m.text == "✏️ Edit Package")
 def edit_package_prompt(message):
@@ -1887,6 +1748,7 @@ def edit_package_description_input(message):
         logging.exception("edit_package_description_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to update package.")
 
+
 @bot.message_handler(func=lambda m: m.text == "🗑 Delete Package")
 def delete_package_prompt(message):
     try:
@@ -1918,6 +1780,7 @@ def delete_package_id_input(message):
     except Exception as e:
         logging.exception("delete_package_id_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to delete package.")
+
 
 @bot.message_handler(func=lambda m: m.text == "🔁 Toggle Active")
 def toggle_package_prompt(message):
@@ -1956,6 +1819,10 @@ def toggle_package_id_input(message):
         logging.exception("toggle_package_id_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to toggle package.")
 
+
+# =========================================================
+# MANAGE ADMINS
+# =========================================================
 @bot.message_handler(func=lambda m: m.text == "👥 Manage Admins")
 def manage_admins_open(message):
     try:
@@ -1963,14 +1830,10 @@ def manage_admins_open(message):
             safe_send_message(message.chat.id, "⛔ Owner only.")
             return
         reset_user(message.chat.id)
-        safe_send_message(
-            message.chat.id,
-            "👥 <b>Admin Manager</b>\n\nOnly owner can add/remove admins.",
-            reply_markup=manage_admin_menu()
-        )
+        safe_send_message(message.chat.id, "👥 <b>Admin Manager</b>\n\nOnly owner can add/remove admins.", reply_markup=manage_admin_menu())
     except Exception as e:
         logging.exception("manage_admins_open failed: %s", e)
-        safe_send_message(message.chat.id, "❌ Failed to open admin manager.")
+
 
 def list_admins_text():
     rows = execute_query(
@@ -1990,6 +1853,7 @@ def list_admins_text():
         text += f"🆔 {row['id']} • TG_ID: <code>{row['tg_id']}</code> • {username}\n"
     return text
 
+
 @bot.message_handler(func=lambda m: m.text == "📋 List Admins")
 def list_admins_handler(message):
     try:
@@ -1999,6 +1863,7 @@ def list_admins_handler(message):
         safe_send_message(message.chat.id, list_admins_text(), reply_markup=manage_admin_menu())
     except Exception as e:
         logging.exception("list_admins_handler failed: %s", e)
+
 
 @bot.message_handler(func=lambda m: m.text == "➕ Add Admin")
 def add_admin_prompt(message):
@@ -2011,6 +1876,7 @@ def add_admin_prompt(message):
     except Exception as e:
         logging.exception("add_admin_prompt failed: %s", e)
 
+
 @bot.message_handler(func=lambda m: user_data.get(m.chat.id, {}).get("step") == "manage_admins_add", content_types=["text"])
 def add_admin_input(message):
     try:
@@ -2021,11 +1887,12 @@ def add_admin_input(message):
 
         username_db = normalize_username(username)
 
+        # tg_id unknown yet, set as 0 + username based access
         execute_query(
             f"""
             INSERT INTO "{TABLE_ADMINS}"(tg_id, username, created_at)
             VALUES (%s, %s, %s)
-            ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username
+            ON CONFLICT (tg_id) DO NOTHING
             """,
             (0, username_db, now_text()),
             commit=True
@@ -2037,6 +1904,7 @@ def add_admin_input(message):
         logging.exception("add_admin_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to add admin.")
 
+
 @bot.message_handler(func=lambda m: m.text == "🗑 Remove Admin")
 def remove_admin_prompt(message):
     try:
@@ -2047,6 +1915,7 @@ def remove_admin_prompt(message):
         safe_send_message(message.chat.id, "🗑 Send admin username to remove.\nဥပမာ: <code>@username</code>", reply_markup=step_back_menu())
     except Exception as e:
         logging.exception("remove_admin_prompt failed: %s", e)
+
 
 @bot.message_handler(func=lambda m: user_data.get(m.chat.id, {}).get("step") == "manage_admins_remove", content_types=["text"])
 def remove_admin_input(message):
@@ -2068,6 +1937,10 @@ def remove_admin_input(message):
         logging.exception("remove_admin_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to remove admin.")
 
+
+# =========================================================
+# BROADCAST / SETTINGS
+# =========================================================
 @bot.message_handler(func=lambda m: m.text == "📢 Broadcast")
 def broadcast_prompt(message):
     try:
@@ -2078,6 +1951,7 @@ def broadcast_prompt(message):
         safe_send_message(message.chat.id, "📢 Send broadcast text to all customers.", reply_markup=step_back_menu())
     except Exception as e:
         logging.exception("broadcast_prompt failed: %s", e)
+
 
 @bot.message_handler(func=lambda m: user_data.get(m.chat.id, {}).get("step") == "broadcast_wait_text", content_types=["text"])
 def broadcast_input(message):
@@ -2102,14 +1976,11 @@ def broadcast_input(message):
                 failed += 1
 
         reset_user(message.chat.id)
-        safe_send_message(
-            message.chat.id,
-            f"✅ Broadcast finished.\n\n📤 Sent: {sent}\n❌ Failed: {failed}",
-            reply_markup=admin_home_markup(message)
-        )
+        safe_send_message(message.chat.id, f"✅ Broadcast finished.\n\n📤 Sent: {sent}\n❌ Failed: {failed}", reply_markup=admin_home_markup(message))
     except Exception as e:
         logging.exception("broadcast_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Broadcast failed.")
+
 
 @bot.message_handler(func=lambda m: m.text == "📱 Change Payment Info")
 def change_payment_info_prompt(message):
@@ -2122,6 +1993,7 @@ def change_payment_info_prompt(message):
     except Exception as e:
         logging.exception("change_payment_info_prompt failed: %s", e)
 
+
 @bot.message_handler(func=lambda m: user_data.get(m.chat.id, {}).get("step") == "change_payment_info", content_types=["text"])
 def change_payment_info_input(message):
     try:
@@ -2131,6 +2003,7 @@ def change_payment_info_input(message):
     except Exception as e:
         logging.exception("change_payment_info_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to update payment info.")
+
 
 @bot.message_handler(func=lambda m: m.text == "👤 Change Admin Username")
 def change_admin_username_prompt(message):
@@ -2142,6 +2015,7 @@ def change_admin_username_prompt(message):
         safe_send_message(message.chat.id, "👤 Send public admin username.\nဥပမာ: <code>@si198</code>", reply_markup=step_back_menu())
     except Exception as e:
         logging.exception("change_admin_username_prompt failed: %s", e)
+
 
 @bot.message_handler(func=lambda m: user_data.get(m.chat.id, {}).get("step") == "change_admin_username", content_types=["text"])
 def change_admin_username_input(message):
@@ -2158,27 +2032,95 @@ def change_admin_username_input(message):
         logging.exception("change_admin_username_input failed: %s", e)
         safe_send_message(message.chat.id, "❌ Failed to update admin username.")
 
-@bot.message_handler(func=lambda m: True)
-def fallback(message):
+
+# =========================================================
+# ADMIN CALLBACKS
+# =========================================================
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("done_", "cancel_", "viewss_")))
+def admin_actions(call):
+    try:
+        if not is_admin_user(call):
+            safe_answer_callback(call.id, "⛔ Admin only.")
+            return
+
+        if call.data.startswith("viewss_"):
+            order_id = int(call.data.split("_")[1])
+            row = get_order_by_id(order_id)
+            if row:
+                safe_send_photo(call.message.chat.id, row["screenshot_file_id"], caption=f"🖼 Screenshot for {format_order_no(order_id)}")
+                safe_answer_callback(call.id, "Screenshot sent.")
+            else:
+                safe_answer_callback(call.id, "Order not found.")
+            return
+
+        action, order_id_text = call.data.split("_")
+        order_id = int(order_id_text)
+        new_status = "Completed" if action == "done" else "Cancelled"
+
+        row = update_order_status(order_id, new_status, admin_note="", admin_action_by=actor_name(call))
+        if not row:
+            safe_answer_callback(call.id, "Order not found.")
+            return
+
+        notify_user(order_id, row["user_id"], new_status)
+        safe_answer_callback(call.id, f"{format_order_no(order_id)} → {new_status}")
+    except Exception as e:
+        logging.exception("admin_actions failed: %s", e)
+        safe_answer_callback(call.id, "❌ Failed.")
+
+
+# =========================================================
+# BACK / CANCEL / FALLBACK
+# =========================================================
+@bot.message_handler(func=lambda m: m.text == "🔙 Back")
+def back_handler(message):
     try:
         state = user_data.get(message.chat.id, {}).get("step", "")
 
-        if state:
-            safe_send_message(message.chat.id, "⚠️ Please finish current step, go Back, or Cancel.", reply_markup=step_back_menu())
-            return
-
         if is_admin_user(message):
-            safe_send_message(message.chat.id, "🛠 Choose from admin panel.", reply_markup=admin_home_markup(message))
+            if state.startswith("manage_categories"):
+                reset_user(message.chat.id)
+                safe_send_message(message.chat.id, "🗂 Back to admin panel.", reply_markup=admin_home_markup(message))
+                return
+
+            if state.startswith("manage_packages"):
+                reset_user(message.chat.id)
+                safe_send_message(message.chat.id, "💎 Back to admin panel.", reply_markup=admin_home_markup(message))
+                return
+
+            if state.startswith("manage_admins"):
+                reset_user(message.chat.id)
+                safe_send_message(message.chat.id, "👥 Back to admin panel.", reply_markup=admin_home_markup(message))
+                return
+
+            if state in ["broadcast_wait_text", "change_payment_info", "change_admin_username", "search_order_wait_id"]:
+                reset_user(message.chat.id)
+                safe_send_message(message.chat.id, "🛠 Back to admin panel.", reply_markup=admin_home_markup(message))
+                return
+
+        if state == "choose_category":
+            reset_user(message.chat.id)
+            safe_send_message(message.chat.id, "🔙 Back to client panel.", reply_markup=client_menu())
+        elif state == "game_id":
+            user_data[message.chat.id] = {"step": "choose_category"}
+            safe_send_message(message.chat.id, "🛒 Choose category again.", reply_markup=category_menu())
+        elif state == "server_id":
+            user_data[message.chat.id]["step"] = "game_id"
+            safe_send_message(message.chat.id, "🎮 Send your Game ID again.", reply_markup=step_back_menu())
+        elif state in ["screenshot", "confirm_order"]:
+            user_data[message.chat.id]["step"] = "server_id"
+            safe_send_message(message.chat.id, "🖥 Send your Server ID again.", reply_markup=step_back_menu())
         else:
-            safe_send_message(message.chat.id, "👤 Choose from client panel.", reply_markup=client_menu())
+            reset_user(message.chat.id)
+            if is_admin_user(message):
+                safe_send_message(message.chat.id, "🛠 Back to admin panel.", reply_markup=admin_home_markup(message))
+            else:
+                safe_send_message(message.chat.id, "👤 Back to client panel.", reply_markup=client_menu())
     except Exception as e:
-        logging.exception("fallback failed: %s", e)
+        logging.exception("back_handler failed: %s", e)
+        safe_send_message(message.chat.id, "❌ Back failed.")
 
 
-
-# =========================================================
-# FALLBACKS
-# =========================================================
 @bot.message_handler(func=lambda m: m.text == "❌ Cancel")
 def cancel_text(message):
     try:
@@ -2194,6 +2136,11 @@ def cancel_text(message):
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
     try:
+        state = user_data.get(message.chat.id, {}).get("step", "")
+        if state:
+            safe_send_message(message.chat.id, "⚠️ Please finish current step, go Back, or Cancel.", reply_markup=step_back_menu())
+            return
+
         if is_admin_user(message):
             safe_send_message(message.chat.id, "🛠 Choose from admin panel.", reply_markup=admin_home_markup(message))
         else:
