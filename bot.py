@@ -1921,6 +1921,10 @@ def fallback(message):
 # ==================================
 def run_bot():
     init_db()
+
+    bot.remove_webhook()
+    time.sleep(1)
+
     while True:
         try:
             logging.info("Bot is running...")
