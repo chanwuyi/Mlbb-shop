@@ -995,7 +995,7 @@ def get_server_id(message):
         f"🎮 <b>Game ID:</b> {user_data[message.chat.id]['game_id']}\n"
         f"🖥 <b>Server ID:</b> {user_data[message.chat.id]['server_id']}\n\n"
         f"{payment_info}\n\n"
-        f"📞 <b>Admin Telegram:</b> {public_username}\n\n"
+        
         f"📸 <b>Payment screenshot ကို photo နဲ့ပို့ပေးပါ။</b>",
         reply_markup=step_back_menu()
     )
